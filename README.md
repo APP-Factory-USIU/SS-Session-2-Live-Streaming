@@ -1,7 +1,3 @@
-Here are the prepared instructions for your Friday session. I have updated the **Nginx version to 1.29.4** (the latest Mainline version as of early 2026) and tailored the notes for your WSL users.
-
----
-
 ### 1. Prerequisites (For Windows Users)
 
 **Windows users must be running WSL (Windows Subsystem for Linux).**
