@@ -1,80 +1,116 @@
-### 1. Prerequisites (For Windows Users)
+# Building a Live Streaming Server (Nginx + RTMP + DASH)
 
-**Windows users must be running WSL (Windows Subsystem for Linux).**
+## 1. The Architecture: Under the Hood
 
-* Open PowerShell as Administrator and run: `wsl --install`
-* Reboot if prompted, then open "Ubuntu" from your start menu to set up your UNIX username and password.
+Before we type a single command, it is important to understand what we are building. This setup mimics the architecture used by platforms like YouTube and Twitch, but on a micro-scale.
+
+### The Pipeline
+
+**`[Broadcaster]`**  **`[Nginx Server]`**  **`[Client/Viewer]`**
+
+### The Protocols
+
+We use two different protocols because they serve different purposes:
+
+1. **Ingestion (RTMP - Real-Time Messaging Protocol):**
+* **What it does:** Creates a persistent TCP "pipe" between the broadcaster (OBS/FFmpeg) and the server.
+* **Why we use it:** It is low-latency and stateful. It is perfect for getting video *to* the server, but it doesn't scale well for thousands of viewers.
+
+
+2. **Delivery (DASH - Dynamic Adaptive Streaming over HTTP):**
+* **What it does:** The server chops the continuous video stream into tiny, static files (chunks) and creates a playlist (manifest).
+* **Why we use it:** It uses standard HTTP (stateless). This means video can be cached by browsers and CDNs, allowing for massive scalability.
+
+
+
+**The Role of `nginx-rtmp-module`:**
+It acts as the translator. It listens for the incoming RTMP stream, instantly fragments it into DASH chunks, and serves those chunks via standard HTTP.
 
 ---
 
-### 2. Download, Build, and Install
+## 2. Prerequisites
 
-Run the following commands inside your WSL (Ubuntu) terminal.
+**For Windows Users:**
+You must be running **WSL (Windows Subsystem for Linux)**.
 
-**Install Build Utilities**
+1. Open PowerShell as Administrator.
+2. Run: `wsl --install`
+3. Reboot if prompted, then open "Ubuntu" from your start menu to set up your UNIX username/password.
+
+**For Linux/Mac Users:**
+Open your standard terminal.
+
+---
+
+## 3. Installation
+
+Run the following commands inside your terminal (WSL/Ubuntu).
+
+### Step A: Install Dependencies
 
 ```bash
 sudo apt-get update
-sudo apt-get install build-essential libpcre3 libpcre3-dev libssl-dev git zlib1g-dev -y
+sudo apt-get install build-essential libpcre3 libpcre3-dev libssl-dev git zlib1g-dev ffmpeg -y
 
 ```
 
-**Make and CD to build directory**
+### Step B: Download Sources
+
+We will download the RTMP module and the **latest Nginx (v1.29.4)**.
 
 ```bash
 sudo mkdir ~/build && cd ~/build
 
-```
-
-**Download & unpack latest nginx-rtmp module**
-
-```bash
+# Clone the RTMP module
 sudo git clone https://github.com/arut/nginx-rtmp-module.git
 
-```
-
-**Download & unpack the LATEST Nginx (Version 1.29.4)**
-*Updated from the original 1.14 version.*
-
-```bash
+# Download Nginx
 sudo wget http://nginx.org/download/nginx-1.29.4.tar.gz
 sudo tar xzf nginx-1.29.4.tar.gz
 cd nginx-1.29.4
 
 ```
 
-**Build Nginx with nginx-rtmp**
+### Step C: Build and Install
 
 ```bash
+# Configure Nginx with the RTMP module
 sudo ./configure --with-http_ssl_module --add-module=../nginx-rtmp-module
+
+# Compile
 sudo make
 sudo make install
 
 ```
 
-**Start Nginx Server**
+---
+
+## 4. Configuration
+
+### Step A: Prepare Directories & Files
+
+We need a folder for the DASH video fragments and we need to move the statistics styling file to a place where Nginx can actually find it.
 
 ```bash
-sudo /usr/local/nginx/sbin/nginx
+# Create DASH storage folder
+sudo mkdir -p /tmp/dash
+sudo chmod 777 /tmp/dash
+
+# Copy the stats styling file to the default web root
+sudo cp ~/build/nginx-rtmp-module/stat.xsl /usr/local/nginx/html/
 
 ```
 
-*(To test if it works, open a browser in Windows and go to `http://localhost:8080`. You should see the "Welcome to nginx!" page or a 404 if the config isn't set yet).*
+### Step B: Edit nginx.conf
 
----
-
-### 3. Set up Live Streaming Config
-
-We need to replace the default config with the RTMP-enabled config.
-
-**Open the config file:**
+Open the configuration file:
 
 ```bash
 sudo nano /usr/local/nginx/conf/nginx.conf
 
 ```
 
-**Delete everything in that file and paste this instead:**
+**Delete everything** in that file and paste the following configuration. This sets up both the RTMP ingest and the DASH HTTP delivery.
 
 ```nginx
 #user  nobody;
@@ -89,7 +125,6 @@ events {
 http {
     include       mime.types;
     default_type  application/octet-stream;
-
     sendfile        on;
     keepalive_timeout  65;
 
@@ -97,21 +132,27 @@ http {
         listen       8080;
         server_name  localhost;
 
-        # rtmp stat
+        # 1. Dashboard for Statistics
         location /stat {
             rtmp_stat all;
             rtmp_stat_stylesheet stat.xsl;
         }
         location /stat.xsl {
-            # root to the library we cloned earlier
-            root /home/YOUR_USERNAME/build/nginx-rtmp-module; 
+            # We moved the file here in Step 4A
+            root /usr/local/nginx/html;
         }
 
-        # rtmp control
-        location /control {
-            rtmp_control all;
+        # 2. DASH Output (Playable in Browser)
+        location /dash {
+            # Serve DASH fragments from /tmp/dash
+            root /tmp;
+            add_header Cache-Control no-cache;
+            
+            # Enable CORS so web players can access the stream
+            add_header Access-Control-Allow-Origin *;
         }
 
+        # Error pages
         error_page   500 502 503 504  /50x.html;
         location = /50x.html {
             root   html;
@@ -128,95 +169,87 @@ rtmp {
         application myapp {
             live on;
 
-            # sample recorder
-            #recorder rec1 {
-            #    record all;
-            #    record_interval 30s;
-            #    record_path /tmp;
-            #    record_unique on;
-            #}
-
-            # sample HLS
-            #hls on;
-            #hls_path /tmp/hls;
-            #hls_sync 100ms;
+            # Enable DASH
+            dash on;
+            dash_path /tmp/dash;
+            dash_fragment 3; # 3-second chunks
         }
     }
 }
 
 ```
 
-*Note: I updated the `root` path in `/stat.xsl` to point to `~/build/nginx-rtmp-module`. You may need to replace `YOUR_USERNAME` with your actual Linux username, or just use `/usr/build/...` if you created the folder at the system root in step 2.*
-
-**Restart Nginx to apply changes:**
+### Step C: Start Nginx
 
 ```bash
-sudo /usr/local/nginx/sbin/nginx -s stop
 sudo /usr/local/nginx/sbin/nginx
 
 ```
 
+*(If you need to restart it later after changing config, use: `sudo /usr/local/nginx/sbin/nginx -s reload`)*
+
 ---
 
-### 4. Publishing with FFmpeg
+## 5. Broadcasting (Ingest)
 
-**Install FFmpeg**
+We will use FFmpeg to simulate a live stream.
 
-```bash
-sudo apt install ffmpeg -y
-
-```
-
-**Test Stream (File Loop)**
-This is the most reliable test for WSL users.
+**Option A: Loop a Video File (Best for testing)**
 
 ```bash
-# Download a dummy video first
+# Download a test video
 wget https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4 -O test.mp4
 
-# Stream it in a loop
+# Stream it forever
 ffmpeg -re -stream_loop -1 -i test.mp4 -c copy -f flv rtmp://localhost/myapp/mystream
 
 ```
 
-**Webcam Streaming (Note for WSL Users)**
-*Warning: Standard WSL does not have direct access to USB webcams. Running the command below will likely fail on Windows unless you have set up `usbipd-win` to attach the USB device to Linux.*
-
-If you are on **Native Linux**, use:
-
-```bash
-ffmpeg -f video4linux2 -i /dev/video0 -c:v libx264 -an -f flv rtmp://localhost/myapp/mystream
-
-```
-
----
-
-### 5. Playing the Stream
-
-**Using VLC (Recommended for Windows)**
-
-1. Open VLC Media Player on Windows.
-2. Go to **Media > Open Network Stream**.
-3. Enter: `rtmp://localhost/myapp/mystream`
-4. Click Play.
-
-**Using FFplay (Inside WSL)**
-
-```bash
-ffplay rtmp://localhost/myapp/mystream
-
-```
-
-**Using OBS (Open Broadcaster Software)**
+**Option B: OBS Studio**
 
 * **Service:** Custom
-* **Server:** `rtmp://localhost/myapp`
+* **Server:** `rtmp://localhost/myapp` (Or `rtmp://YOUR_WSL_IP/myapp` if localhost fails)
 * **Stream Key:** `mystream`
 
 ---
 
-### 6. Statistics
+## 6. Watching the Stream (Egress)
 
-Navigate your Windows browser to `http://localhost:8080/stat` to see the live bandwidth and client info.
+### Statistics Dashboard
 
-Would you like me to create a quick troubleshooting cheat sheet for common "Port 1935 in use" or "Permission denied" errors that might pop up during the session?
+Go to: `http://localhost:8080/stat`
+*You should see a table showing "myapp", "mystream", and data throughput.*
+
+### Playing via DASH (HTTP)
+
+The URL structure is: `http://localhost:8080/dash/STREAM_KEY.mpd`
+**URL:** `http://localhost:8080/dash/mystream.mpd`
+
+**How to watch:**
+
+1. **VLC:** Go to *Media > Open Network Stream* and paste the URL.
+2. **Web:** Go to the [Dash.js Reference Player](https://reference.dashif.org/dash.js/latest/samples/dash-if-reference-player/index.html) and paste the URL.
+
+---
+
+## 7. Troubleshooting Cheat Sheet
+
+**1. "Address already in use" Error**
+
+* *Cause:* You tried to start Nginx but it's already running.
+* *Fix:* `sudo killall nginx` then start it again.
+
+**2. Stats page shows raw code (XML) instead of a table**
+
+* *Cause:* Nginx can't find `stat.xsl`.
+* *Fix:* Ensure you ran the `cp` command in **Step 4A** and that your `nginx.conf` points to `/usr/local/nginx/html`.
+
+**3. OBS cannot connect to "localhost"**
+
+* *Cause:* Windows sometimes struggles to resolve `localhost` to the WSL Linux instance.
+* *Fix:* In WSL terminal, run `ip addr` to find your eth0 IP (e.g., 172.x.x.x). Use that IP in OBS instead of localhost.
+
+**4. Permission Denied (Video won't play)**
+
+* *Cause:* Nginx cannot write to the temp folder.
+* *Fix:* `sudo chmod 777 /tmp/dash`
